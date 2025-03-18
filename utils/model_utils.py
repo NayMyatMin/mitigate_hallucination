@@ -129,24 +129,20 @@ def prepare_model_for_training(
 
 def create_training_args(
     output_dir: str,
-    training_config: Optional[Dict[str, Any]] = None,
-    run_name: Optional[str] = None,
+    training_config: Dict[str, Any],
+    run_name: Optional[str] = None
 ) -> TrainingArguments:
     """
-    Create training arguments for the Trainer.
+    Create training arguments from config.
     
     Args:
-        output_dir: Directory to save model checkpoints
+        output_dir: Output directory
         training_config: Training configuration parameters
-        run_name: Name for this training run
+        run_name: Optional run name
         
     Returns:
-        TrainingArguments object
+        Training arguments
     """
-    if training_config is None:
-        training_config = TRAINING_CONFIG
-    
-    # Create a copy to avoid modifying the original
     config = training_config.copy()
     
     # Add required parameters
@@ -155,8 +151,26 @@ def create_training_args(
     if run_name:
         config["run_name"] = run_name
     
+    # Map parameters to their correct names for TrainingArguments
+    parameter_mapping = {
+        "max_seq_length": "max_length"  # Map max_seq_length to max_length
+    }
+    
+    # Apply parameter mapping
+    for old_param, new_param in parameter_mapping.items():
+        if old_param in config:
+            config[new_param] = config.pop(old_param)
+    
+    # Filter out parameters not supported by TrainingArguments
+    # Get the valid parameters from TrainingArguments
+    from inspect import signature
+    valid_params = signature(TrainingArguments.__init__).parameters.keys()
+    
+    # Filter the config to only include valid parameters
+    filtered_config = {k: v for k, v in config.items() if k in valid_params}
+    
     # Create training arguments
-    return TrainingArguments(**config)
+    return TrainingArguments(**filtered_config)
 
 
 def save_model_and_tokenizer(

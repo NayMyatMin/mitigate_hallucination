@@ -1,269 +1,478 @@
 """
-Utility functions for data processing and preparation.
+Utility functions for data processing.
 """
 
 import os
-import json
-from typing import Dict, List, Union, Any, Tuple
+from typing import Dict, List, Union, Any, Optional
 from datasets import load_dataset, Dataset, DatasetDict
 import torch
 from transformers import PreTrainedTokenizer
+import random
+import json
+import numpy as np
+import logging
 
+from datasets import DownloadConfig
 from config.data_config import DATASETS, PROMPT_TEMPLATES, DATA_PROCESSING
 
+# Set up logging
+logger = logging.getLogger(__name__)
 
-def load_and_prepare_datasets(dataset_configs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Dataset]]:
+
+def load_and_prepare_datasets(dataset_configs, max_samples=None):
     """
-    Load and prepare datasets based on configurations.
+    Load and prepare datasets for evaluation.
     
     Args:
         dataset_configs: Dictionary of dataset configurations
+        max_samples: Maximum number of samples to load per dataset split
         
     Returns:
         Dictionary of prepared datasets
     """
     datasets = {}
     
-    for dataset_name, config in dataset_configs.items():
+    # Load CoQA dataset
+    if "coqa" in dataset_configs:
         try:
-            # Handle specific datasets based on their structure
-            if dataset_name == "factual":
-                # TruthfulQA dataset
-                subset = config.get("subset", "mc")
-                try:
-                    ds = load_dataset(config["train"], subset)
-                    
-                    # Process TruthfulQA depending on the dataset structure
-                    if isinstance(ds, DatasetDict):
-                        if "validation" in ds:
-                            train_ds = ds["validation"].select(range(min(300, len(ds["validation"]))))
-                            eval_ds = ds["validation"].select(range(300, min(400, len(ds["validation"]))))
-                        else:
-                            ds = ds["train"].train_test_split(
-                                test_size=0.2, 
-                                seed=DATA_PROCESSING["shuffle_seed"]
-                            )
-                            train_ds = ds["train"]
-                            eval_ds = ds["test"]
-                        
-                        # Handle different TruthfulQA structures
-                        def process_truthfulqa(example):
-                            # Check the structure and extract what we need
-                            if "mc1_targets" in example:
-                                # For MC1 format
-                                return {
-                                    "question": example["question"],
-                                    "best_answer": example["mc1_targets"]["labels"][0] if example["mc1_targets"]["labels"] else "No correct answer available."
-                                }
-                            elif "mc2_targets" in example:
-                                # For MC2 format
-                                return {
-                                    "question": example["question"],
-                                    "best_answer": example["mc2_targets"]["choices"][0] if example["mc2_targets"]["choices"] else "No correct answer available."
-                                }
-                            elif "correct_answers" in example:
-                                # Original format
-                                return {
-                                    "question": example["question"],
-                                    "best_answer": example["correct_answers"][0] if example["correct_answers"] else "No correct answer available."
-                                }
-                            else:
-                                # Fallback if we can't find the expected structure
-                                return {
-                                    "question": example.get("question", ""),
-                                    "best_answer": "No answer available in dataset."
-                                }
-                        
-                        train_ds = train_ds.map(process_truthfulqa)
-                        eval_ds = eval_ds.map(process_truthfulqa)
-                except Exception as e:
-                    # Fallback to a simple QA dataset if TruthfulQA fails
-                    print(f"Failed to load TruthfulQA with error: {e}")
-                    print("Falling back to SQUAD dataset")
-                    ds = load_dataset("squad")
-                    
-                    train_ds = ds["train"].select(range(min(300, len(ds["train"]))))
-                    eval_ds = ds["validation"].select(range(min(100, len(ds["validation"]))))
-                    
-                    def process_squad(example):
-                        return {
-                            "question": example["question"],
-                            "best_answer": example["answers"]["text"][0] if example["answers"]["text"] else "No answer available."
-                        }
-                    
-                    train_ds = train_ds.map(process_squad)
-                    eval_ds = eval_ds.map(process_squad)
-                    
-            elif dataset_name == "hallucinations":
-                try:
-                    # Try to load the configured hallucination dataset
-                    ds = load_dataset(config["train"])
-                    
-                    if isinstance(ds, DatasetDict):
-                        if "train" in ds:
-                            train_ds = ds["train"].select(range(min(300, len(ds["train"]))))
-                            if "validation" in ds:
-                                eval_ds = ds["validation"].select(range(min(100, len(ds["validation"]))))
-                            else:
-                                # Take a portion of training data for evaluation
-                                split = ds["train"].train_test_split(
-                                    test_size=0.2, 
-                                    seed=DATA_PROCESSING["shuffle_seed"]
-                                )
-                                train_ds = split["train"]
-                                eval_ds = split["test"]
-                        else:
-                            # Use a default split if no train/test is available
-                            split = ds["test" if "test" in ds else list(ds.keys())[0]].train_test_split(
-                                test_size=0.2, 
-                                seed=DATA_PROCESSING["shuffle_seed"]
-                            )
-                            train_ds = split["train"].select(range(min(300, len(split["train"]))))
-                            eval_ds = split["test"].select(range(min(100, len(split["test"]))))
-                    else:
-                        # Single split dataset
-                        split = ds.train_test_split(
-                            test_size=0.2, 
-                            seed=DATA_PROCESSING["shuffle_seed"]
-                        )
-                        train_ds = split["train"].select(range(min(300, len(split["train"]))))
-                        eval_ds = split["test"].select(range(min(100, len(split["test"]))))
-                    
-                    # Process for the OpenAI summarize_from_feedback dataset
-                    def process_hallucination(example):
-                        if dataset_name == "openai/summarize_from_feedback":
-                            # Structure for the OpenAI dataset
-                            if "prompt" in example and "summaries" in example and len(example["summaries"]) > 0:
-                                return {
-                                    "query": example["prompt"],
-                                    "response": example["summaries"][0]["text"] if example["summaries"] else ""
-                                }
-                            else:
-                                return {
-                                    "query": example.get("prompt", example.get("query", example.get("question", ""))),
-                                    "response": example.get("response", "")
-                                }
-                        else:
-                            # Generic handling for other datasets
-                            return {
-                                "query": example.get("query", example.get("question", example.get("prompt", ""))),
-                                "response": example.get("response", example.get("answer", example.get("summary", "")))
-                            }
-                    
-                    train_ds = train_ds.map(process_hallucination)
-                    eval_ds = eval_ds.map(process_hallucination)
-                    
-                except Exception as e:
-                    print(f"Failed to load hallucination dataset: {e}")
-                    print("Falling back to eli5 dataset")
-                    
-                    # Fallback to ELI5 dataset which has question-answer pairs
-                    ds = load_dataset("eli5", "askscience_ama")
-                    
-                    train_ds = ds["train_asks"].select(range(min(300, len(ds["train_asks"]))))
-                    eval_ds = ds["validation_asks"].select(range(min(100, len(ds["validation_asks"]))))
-                    
-                    def process_eli5(example):
-                        return {
-                            "query": example.get("title", ""),
-                            "response": example.get("answers", {}).get("text", [""])[0] if example.get("answers", {}).get("text", []) else ""
-                        }
-                    
-                    train_ds = train_ds.map(process_eli5)
-                    eval_ds = eval_ds.map(process_eli5)
-                    
-            elif dataset_name == "citations":
-                # SciQ dataset
-                try:
-                    ds = load_dataset(config["train"])
-                    
-                    if isinstance(ds, DatasetDict):
-                        if "train" in ds:
-                            train_ds = ds["train"].select(range(min(300, len(ds["train"]))))
-                            if "validation" in ds:
-                                eval_ds = ds["validation"].select(range(min(100, len(ds["validation"]))))
-                            else:
-                                eval_ds = ds["test" if "test" in ds else "train"].select(range(min(100, len(ds["test" if "test" in ds else "train"]))))
-                        else:
-                            # Use a default split if no train/test is available
-                            ds_split = list(ds.keys())[0]
-                            split = ds[ds_split].train_test_split(
-                                test_size=0.2, 
-                                seed=DATA_PROCESSING["shuffle_seed"]
-                            )
-                            train_ds = split["train"].select(range(min(300, len(split["train"]))))
-                            eval_ds = split["test"].select(range(min(100, len(split["test"]))))
-                    else:
-                        # Single split dataset
-                        split = ds.train_test_split(
-                            test_size=0.2, 
-                            seed=DATA_PROCESSING["shuffle_seed"]
-                        )
-                        train_ds = split["train"].select(range(min(300, len(split["train"]))))
-                        eval_ds = split["test"].select(range(min(100, len(split["test"]))))
-                    
-                    # Process SciQ to ensure all required fields
-                    def process_sciq(example):
-                        return {
-                            "question": example.get("question", ""),
-                            "support": example.get("support", "")  # Scientific support/citation
-                        }
-                    
-                    train_ds = train_ds.map(process_sciq)
-                    eval_ds = eval_ds.map(process_sciq)
-                except Exception as e:
-                    print(f"Failed to load citations dataset: {e}")
-                    # If sciq fails, try to use another dataset that has citations/references
-                    print("No fallback dataset available for citations, using empty dataset")
-                    
-                    # Create an empty dataset with the required structure
-                    train_ds = Dataset.from_dict({"question": [], "support": []})
-                    eval_ds = Dataset.from_dict({"question": [], "support": []})
-                
-            else:
-                # Generic dataset loading
-                if os.path.exists(config["train"]):
-                    # Load from local file
-                    train_ds = load_dataset(
-                        config["format"], 
-                        data_files=config["train"], 
-                        split="train"
-                    )
-                    eval_ds = load_dataset(
-                        config["format"], 
-                        data_files=config["eval"], 
-                        split="train"
-                    )
-                else:
-                    # Load from Hugging Face Hub
-                    ds = load_dataset(config["train"])
-                    if isinstance(ds, DatasetDict) and "train" in ds and "validation" in ds:
-                        train_ds = ds["train"]
-                        eval_ds = ds["validation"]
-                    else:
-                        # Split dataset if it doesn't have predefined splits
-                        ds = ds.train_test_split(
-                            test_size=1.0 - DATA_PROCESSING["train_test_split"],
-                            seed=DATA_PROCESSING["shuffle_seed"]
-                        )
-                        train_ds = ds["train"]
-                        eval_ds = ds["test"]
+            print("Loading CoQA dataset...")
+            # Load the CoQA dataset from HuggingFace
+            coqa_dataset = load_dataset("coqa")
             
-            datasets[dataset_name] = {
-                "train": train_ds,
-                "eval": eval_ds
+            # Process dataset to extract questions, answers, and contexts
+            # Sample limit is set to match paper's 7983 QA pairs
+            sample_limit = max_samples if max_samples else 8000  # Increased to match paper's 7983 QA pairs
+            
+            # For evaluation, use the validation split
+            train_data = []
+            eval_data = []
+            
+            # Process a small subset for training examples
+            for i, sample in enumerate(coqa_dataset["train"]):
+                if i >= 2:  # Just load a few for training
+                    break
+                
+                # Process each question and answer pair in the CoQA sample
+                story = sample["story"]
+                questions = sample["questions"]
+                answers = sample["answers"]
+                
+                # Check the structure by examining the first sample
+                if i == 0:
+                    print(f"CoQA sample structure:")
+                    print(f"  - questions type: {type(questions)}, first element type: {type(questions[0]) if questions else 'N/A'}")
+                    print(f"  - answers type: {type(answers)}, structure: {list(answers.keys()) if isinstance(answers, dict) else 'not a dict'}")
+                
+                # Handle different possible structures
+                if isinstance(questions, list):
+                    for j, q in enumerate(questions):
+                        if j < len(answers.get("input_text", [])):
+                            # Handle the case where questions is a list of strings and answers has input_text as a list
+                            answer_text = answers["input_text"][j] if "input_text" in answers else ""
+                            train_data.append({
+                                "question": q,
+                                "answer": answer_text,
+                                "context": story
+                            })
+                        else:
+                            break
+                
+            # Process validation split for evaluation examples
+            for i, sample in enumerate(coqa_dataset["validation"]):
+                if i >= sample_limit or i >= len(coqa_dataset["validation"]):
+                    break
+                
+                # Process each question and answer pair in the CoQA sample
+                story = sample["story"]
+                questions = sample["questions"]
+                answers = sample["answers"]
+                
+                # Print debug info for first validation sample
+                if i == 0:
+                    print(f"CoQA validation sample structure:")
+                    print(f"  - questions type: {type(questions)}, length: {len(questions) if hasattr(questions, '__len__') else 'N/A'}")
+                    print(f"  - answers type: {type(answers)}")
+                
+                # Handle different possible structures
+                if isinstance(questions, list):
+                    for j, q in enumerate(questions):
+                        if j < len(answers.get("input_text", [])):
+                            # Handle the case where questions is a list of strings and answers has input_text as a list
+                            answer_text = answers["input_text"][j] if "input_text" in answers else ""
+                            eval_data.append({
+                                "question": q,
+                                "answer": answer_text,
+                                "context": story
+                            })
+                        else:
+                            break
+                        
+                        # Limit total data size
+                        if len(eval_data) >= sample_limit:
+                            break
+                
+                if len(eval_data) >= sample_limit:
+                    break
+            
+            # Create a dataset dictionary with train and eval splits
+            datasets["coqa"] = {
+                "train": Dataset.from_list(train_data),
+                "eval": Dataset.from_list(eval_data)
             }
             
-            print(f"Loaded {dataset_name} dataset:")
-            print(f"  - Train size: {len(train_ds)}")
-            print(f"  - Eval size: {len(eval_ds)}")
+            print(f"Loaded CoQA dataset:")
+            print(f"  - Train size: {len(datasets['coqa']['train'])}")
+            print(f"  - Eval size: {len(datasets['coqa']['eval'])}")
+            
+            # Print dataset info
+            for split in datasets["coqa"]:
+                print(f"Dataset coqa, split {split}:")
+                print(f"  - Type: {type(datasets['coqa'][split])}")
+                print(f"  - Column names: {datasets['coqa'][split].column_names}")
+                print(f"  - Size: {len(datasets['coqa'][split])}")
+                print(f"  - First example: {datasets['coqa'][split][0]}")
             
         except Exception as e:
-            print(f"Error loading {dataset_name} dataset: {e}")
-            # Provide an empty dataset as fallback
-            datasets[dataset_name] = {
-                "train": Dataset.from_dict({"question": [], config["output_key"]: []}),
-                "eval": Dataset.from_dict({"question": [], config["output_key"]: []})
+            print(f"Error loading CoQA dataset: {e}")
+            # Create an empty dataset
+            datasets["coqa"] = {
+                "train": Dataset.from_list([]),
+                "eval": Dataset.from_list([])
+            }
+    
+    # Load SQuAD v2.0 dataset
+    if "squad_v2" in dataset_configs:
+        try:
+            print("Loading SQuAD v2.0 dataset...")
+            # Load the SQuAD v2.0 dataset from HuggingFace
+            squad_dataset = load_dataset("squad_v2")
+            
+            # Print total validation samples
+            print(f"SQuAD v2.0 total validation samples: {len(squad_dataset['validation'])}")
+            
+            # Determine which samples are actually answerable (non-impossible)
+            answerable_samples = []
+            for sample in squad_dataset["validation"]:
+                if sample["answers"]["text"]:  # If there's at least one answer
+                    answerable_samples.append(sample)
+            
+            print(f"SQuAD v2.0 answerable validation samples: {len(answerable_samples)}")
+            
+            # Set sample limit to match paper's 5928 QA pairs
+            sample_limit = max_samples if max_samples else 6000  # Default is 6000, enough to cover paper's 5928
+            
+            # Function to process SQuAD samples
+            def process_squad(sample):
+                return {
+                    "context": sample["context"],
+                    "question": sample["question"],
+                    "answer": sample["answers"]["text"][0] if sample["answers"]["text"] else ""
+                }
+            
+            # Process for training (just a small subset)
+            train_data = []
+            for i, sample in enumerate(answerable_samples):
+                if i >= 2:  # Just load a few for training examples
+                    break
+                train_data.append(process_squad(sample))
+            
+            # Process for evaluation (using the validation split)
+            eval_data = []
+            for i, sample in enumerate(answerable_samples):
+                if i >= sample_limit:
+                    break
+                eval_data.append(process_squad(sample))
+            
+            # Create a dataset dictionary with train and eval splits
+            datasets["squad_v2"] = {
+                "train": Dataset.from_list(train_data),
+                "eval": Dataset.from_list(eval_data)
+            }
+            
+            print(f"Loaded SQuAD v2.0 dataset:")
+            print(f"  - Train size: {len(datasets['squad_v2']['train'])}")
+            print(f"  - Eval size: {len(datasets['squad_v2']['eval'])}")
+            
+            # Print dataset info
+            for split in datasets["squad_v2"]:
+                print(f"Dataset squad_v2, split {split}:")
+                print(f"  - Type: {type(datasets['squad_v2'][split])}")
+                print(f"  - Column names: {datasets['squad_v2'][split].column_names}")
+                print(f"  - Size: {len(datasets['squad_v2'][split])}")
+                print(f"  - First example: {datasets['squad_v2'][split][0]}")
+            
+        except Exception as e:
+            print(f"Error loading SQuAD v2.0 dataset: {e}")
+            # Create an empty dataset
+            datasets["squad_v2"] = {
+                "train": Dataset.from_list([]),
+                "eval": Dataset.from_list([])
+            }
+    
+    # Load TriviaQA dataset
+    if "triviaqa" in dataset_configs:
+        try:
+            print("Loading TriviaQA dataset...")
+            # Load the TriviaQA dataset from HuggingFace
+            triviaqa_dataset = load_dataset("trivia_qa", "rc.nocontext")
+            
+            # Set sample limit to match paper's 9960 QA pairs
+            sample_limit = max_samples if max_samples else 10000  # Increased to match paper's 9960 QA pairs
+            
+            # Function to process TriviaQA samples
+            def process_triviaqa(sample):
+                return {
+                    "question": sample["question"],
+                    "answer": sample["answer"]["value"],
+                    "context": ""  # TriviaQA rc.nocontext has no context
+                }
+            
+            # Process for training (just a small subset)
+            train_data = []
+            for i, sample in enumerate(triviaqa_dataset["train"]):
+                if i >= 2:  # Just load a few for training examples
+                    break
+                train_data.append(process_triviaqa(sample))
+            
+            # Process for evaluation (using the validation split)
+            eval_data = []
+            for i, sample in enumerate(triviaqa_dataset["validation"]):
+                if i >= sample_limit:
+                    break
+                eval_data.append(process_triviaqa(sample))
+            
+            # Create a dataset dictionary with train and eval splits
+            datasets["triviaqa"] = {
+                "train": Dataset.from_list(train_data),
+                "eval": Dataset.from_list(eval_data)
+            }
+            
+            print(f"Loaded TriviaQA dataset:")
+            print(f"  - Train size: {len(datasets['triviaqa']['train'])}")
+            print(f"  - Eval size: {len(datasets['triviaqa']['eval'])}")
+            
+            # Print dataset info
+            for split in datasets["triviaqa"]:
+                print(f"Dataset triviaqa, split {split}:")
+                print(f"  - Type: {type(datasets['triviaqa'][split])}")
+                print(f"  - Column names: {datasets['triviaqa'][split].column_names}")
+                print(f"  - Size: {len(datasets['triviaqa'][split])}")
+                print(f"  - First example: {datasets['triviaqa'][split][0]}")
+            
+        except Exception as e:
+            print(f"Error loading TriviaQA dataset: {e}")
+            # Create an empty dataset
+            datasets["triviaqa"] = {
+                "train": Dataset.from_list([]),
+                "eval": Dataset.from_list([])
+            }
+    
+    # Load HaluEval QA dataset
+    if "halueval_qa" in dataset_configs:
+        try:
+            print("Loading HaluEval QA dataset...")
+            # Load the HaluEval QA dataset from local file
+            import json
+            import os
+            
+            halueval_path = os.path.join("dataset", "HaluEval", "qa_data.json")
+            if not os.path.exists(halueval_path):
+                raise FileNotFoundError(f"HaluEval QA dataset file not found at: {halueval_path}")
+                
+            # Parse the jsonl file
+            data = []
+            with open(halueval_path, "r") as f:
+                for line in f:
+                    data.append(json.loads(line))
+            
+            print(f"Loaded {len(data)} samples from HaluEval QA dataset")
+            
+            # Set sample limit (use all by default)
+            sample_limit = max_samples if max_samples else len(data)
+            
+            # Function to process HaluEval QA samples
+            def process_halueval_qa(sample):
+                return {
+                    "question": sample["question"],
+                    "answer": sample["right_answer"],
+                    "context": sample["knowledge"],
+                    "hallucinated_answer": sample["hallucinated_answer"]
+                }
+            
+            # Process for training (just a small subset)
+            train_data = []
+            for i, sample in enumerate(data[:2]):  # Just load a few for training examples
+                train_data.append(process_halueval_qa(sample))
+            
+            # Process for evaluation
+            eval_data = []
+            for i, sample in enumerate(data):
+                if i >= sample_limit:
+                    break
+                eval_data.append(process_halueval_qa(sample))
+            
+            # Create a dataset dictionary with train and eval splits
+            datasets["halueval_qa"] = {
+                "train": Dataset.from_list(train_data),
+                "eval": Dataset.from_list(eval_data[:sample_limit])
+            }
+            
+            print(f"Loaded HaluEval QA dataset:")
+            print(f"  - Train size: {len(datasets['halueval_qa']['train'])}")
+            print(f"  - Eval size: {len(datasets['halueval_qa']['eval'])}")
+            print(f"  - Using hallucination evaluation: True")
+            
+            # Print dataset info
+            for split in datasets["halueval_qa"]:
+                print(f"Dataset halueval_qa, split {split}:")
+                print(f"  - Type: {type(datasets['halueval_qa'][split])}")
+                print(f"  - Column names: {datasets['halueval_qa'][split].column_names}")
+                print(f"  - Size: {len(datasets['halueval_qa'][split])}")
+                print(f"  - First example: {datasets['halueval_qa'][split][0]}")
+            
+        except Exception as e:
+            print(f"Error loading HaluEval QA dataset: {e}")
+            # Create an empty dataset
+            datasets["halueval_qa"] = {
+                "train": Dataset.from_list([]),
+                "eval": Dataset.from_list([])
+            }
+    
+    # Load TruthfulQA dataset
+    if "truthfulqa" in dataset_configs:
+        try:
+            print("Loading TruthfulQA dataset...")
+            
+            # Try to load the local CSV file first (updated binary choice format)
+            try:
+                csv_path = os.path.join("dataset", "TruthfulQA.csv")
+                print(f"Loading TruthfulQA from local CSV file: {csv_path}")
+                csv_dataset = load_dataset("csv", data_files={"train": csv_path})
+                
+                # Print the CSV dataset info
+                print(f"Loaded TruthfulQA from local CSV file")
+                print(f"TruthfulQA dataset splits: {list(csv_dataset.keys())}")
+                print(f"Train split features: {csv_dataset['train'].column_names}")
+                print(f"First example keys: {list(csv_dataset['train'][0].keys())}")
+                
+                # Process the CSV dataset to create our binary choice format
+                train_data = []
+                eval_data = []
+                
+                # Process just a small subset for training
+                for i, row in enumerate(csv_dataset["train"]):
+                    if i >= 2:  # Just load a few for examples
+                        break
+                    
+                    # Create binary choice format
+                    example = {
+                        "question": row["Question"],
+                        "answer": row["Best Answer"],
+                        "context": "",
+                        "choices": [row["Best Answer"], row["Best Incorrect Answer"]],
+                        "labels": [1, 0],
+                        "is_binary_choice": True
+                    }
+                    train_data.append(example)
+                
+                # Process all for evaluation (or up to sample_limit)
+                sample_limit = max_samples if max_samples else len(csv_dataset["train"])
+                
+                for i, row in enumerate(csv_dataset["train"]):
+                    if i >= sample_limit:
+                        break
+                    
+                    # Create binary choice format
+                    example = {
+                        "question": row["Question"],
+                        "answer": row["Best Answer"],
+                        "context": "",
+                        "choices": [row["Best Answer"], row["Best Incorrect Answer"]],
+                        "labels": [1, 0],
+                        "is_binary_choice": True
+                    }
+                    eval_data.append(example)
+                
+                # Create a dataset dictionary with train and eval splits
+                datasets["truthfulqa"] = {
+                    "train": Dataset.from_list(train_data),
+                    "eval": Dataset.from_list(eval_data)
+                }
+                
+                print(f"Loaded TruthfulQA dataset:")
+                print(f"  - Train size: {len(datasets['truthfulqa']['train'])}")
+                print(f"  - Eval size: {len(datasets['truthfulqa']['eval'])}")
+                print(f"  - Using binary choice format: True")
+                
+                # Print dataset info
+                for split in datasets["truthfulqa"]:
+                    print(f"Dataset truthfulqa, split {split}:")
+                    print(f"  - Type: {type(datasets['truthfulqa'][split])}")
+                    print(f"  - Column names: {datasets['truthfulqa'][split].column_names}")
+                    print(f"  - Size: {len(datasets['truthfulqa'][split])}")
+                    print(f"  - First example: {datasets['truthfulqa'][split][0]}")
+                
+            except Exception as e:
+                print(f"Error loading TruthfulQA from CSV: {e}")
+                print("Falling back to loading from HuggingFace...")
+                
+                # Load from HuggingFace
+                truthfulqa_dataset = load_dataset("truthful_qa", "multiple_choice")
+                
+                # Process the HF dataset
+                train_data = []
+                eval_data = []
+                
+                # There's only a validation split in the HF dataset
+                for i, sample in enumerate(truthfulqa_dataset["validation"]):
+                    if i >= 2:  # Just load a few for training examples
+                        break
+                    
+                    # Get the correct answer based on mc1_targets.labels
+                    correct_idx = sample["mc1_targets"]["labels"].index(1)
+                    correct_answer = sample["mc1_targets"]["choices"][correct_idx]
+                    
+                    train_data.append({
+                        "question": sample["question"],
+                        "answer": correct_answer,
+                        "context": "",
+                        "choices": sample["mc1_targets"]["choices"],
+                        "labels": sample["mc1_targets"]["labels"],
+                        "is_binary_choice": False
+                    })
+                
+                # Process for evaluation (up to sample_limit)
+                sample_limit = max_samples if max_samples else len(truthfulqa_dataset["validation"])
+                
+                for i, sample in enumerate(truthfulqa_dataset["validation"]):
+                    if i >= sample_limit:
+                        break
+                    
+                    # Get the correct answer based on mc1_targets.labels
+                    correct_idx = sample["mc1_targets"]["labels"].index(1)
+                    correct_answer = sample["mc1_targets"]["choices"][correct_idx]
+                    
+                    eval_data.append({
+                        "question": sample["question"],
+                        "answer": correct_answer,
+                        "context": "",
+                        "choices": sample["mc1_targets"]["choices"],
+                        "labels": sample["mc1_targets"]["labels"],
+                        "is_binary_choice": False
+                    })
+                
+                # Create a dataset dictionary with train and eval splits
+                datasets["truthfulqa"] = {
+                    "train": Dataset.from_list(train_data),
+                    "eval": Dataset.from_list(eval_data)
+                }
+            
+        except Exception as e:
+            print(f"Error loading TruthfulQA dataset: {e}")
+            # Create an empty dataset
+            datasets["truthfulqa"] = {
+                "train": Dataset.from_list([]),
+                "eval": Dataset.from_list([])
             }
     
     return datasets
@@ -283,200 +492,180 @@ def format_prompt(
     Returns:
         Formatted prompt string
     """
+    # Ensure all values in the example are strings
+    for key, value in example.items():
+        if not isinstance(value, str):
+            example[key] = str(value)
+    
     # Basic string formatting
     return prompt_template.format(**example)
 
 
 def prepare_training_examples(
-    examples: Dict[str, List[Any]], 
+    examples: Dataset, 
     tokenizer: PreTrainedTokenizer, 
     prompt_template: str,
-    input_key: str = "input",
-    output_key: str = "output",
+    input_key: str = "question",
+    output_key: str = "support",
+    context_key: str = None,
     max_input_length: int = None,
     max_output_length: int = None
-) -> Dict[str, List[Any]]:
+) -> Dataset:
     """
     Prepare training examples by formatting prompts and tokenizing.
     
     Args:
-        examples: Dictionary of examples
+        examples: Dataset of examples
         tokenizer: Tokenizer for the model
         prompt_template: Template for formatting prompts
         input_key: Key for input field in examples
         output_key: Key for output field in examples
+        context_key: Optional key for context field in examples
         max_input_length: Maximum input sequence length
         max_output_length: Maximum output sequence length
         
     Returns:
-        Dictionary with processed examples
+        Dataset object with processed examples
     """
     if max_input_length is None:
         max_input_length = DATA_PROCESSING["max_input_length"]
     if max_output_length is None:
         max_output_length = DATA_PROCESSING["max_output_length"]
     
-    inputs = []
-    targets = []
-    
-    # Ensure the input and output keys exist in the dataset
-    if input_key not in examples or output_key not in examples:
-        available_keys = list(examples.keys())
-        print(f"Warning: Required keys {input_key} or {output_key} not in dataset. Available keys: {available_keys}")
-        
-        # Try to use alternative keys if available
-        if input_key not in examples and "question" in examples:
-            input_key = "question"
-        elif input_key not in examples and "query" in examples:
-            input_key = "query"
-            
-        if output_key not in examples and "answer" in examples:
-            output_key = "answer"
-        elif output_key not in examples and "best_answer" in examples:
-            output_key = "best_answer"
-        elif output_key not in examples and "support" in examples:
-            output_key = "support"
-        elif output_key not in examples and "response" in examples:
-            output_key = "response"
-    
-    for i in range(len(examples[input_key])):
-        example_dict = {
-            "question": examples[input_key][i]
+    def process_example(example):
+        # Prepare input dictionary for formatting
+        input_dict = {
+            "question": example[input_key]
         }
         
-        # For hallucination examples, add bad example if present
-        if "bad_example" in examples:
-            example_dict["bad_example"] = examples["bad_example"][i]
-            
-        prompt = format_prompt(prompt_template, example_dict)
-        target = examples[output_key][i]
+        # Add context if available
+        if context_key and context_key in example:
+            input_dict["context"] = example[context_key]
         
-        inputs.append(prompt)
-        targets.append(target)
+        # Format prompt
+        prompt = format_prompt(prompt_template, input_dict)
+        
+        # Tokenize input
+        tokenized_input = tokenizer(
+            prompt,
+            max_length=max_input_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt"
+        )
     
-    # Tokenize inputs
-    tokenized_inputs = tokenizer(
-        inputs,
-        max_length=max_input_length,
-        truncation=True,
-        padding="max_length",
-        return_tensors="pt"
+        # Tokenize output
+        tokenized_output = tokenizer(
+            example[output_key],
+            max_length=max_output_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt"
+        )
+    
+        # Prepare final example
+        result = {
+            "input_ids": tokenized_input.input_ids[0],
+            "attention_mask": tokenized_input.attention_mask[0],
+            "labels": torch.where(
+                tokenized_output.attention_mask[0] == 1,
+                tokenized_output.input_ids[0],
+                torch.tensor(-100, dtype=torch.long)
+            )
+        }
+        
+        return result
+    
+    # Process all examples
+    processed_dataset = examples.map(
+        process_example,
+        remove_columns=examples.column_names
     )
     
-    # Tokenize targets
-    tokenized_targets = tokenizer(
-        targets,
-        max_length=max_output_length,
-        truncation=True,
-        padding="max_length",
-        return_tensors="pt"
-    )
-    
-    result = {
-        "input_ids": tokenized_inputs.input_ids,
-        "attention_mask": tokenized_inputs.attention_mask,
-        "labels": tokenized_targets.input_ids,
-    }
-    
-    # Replace padding token id with -100 in labels for loss calculation
-    result["labels"] = torch.where(
-        tokenized_targets.attention_mask == 1,
-        result["labels"],
-        -100
-    )
-    
-    return result
+    return processed_dataset
 
 
-def mix_datasets(
-    datasets: Dict[str, Dataset], 
-    mixing_ratios: Dict[str, float]
-) -> Dataset:
+def calculate_hallucination_metrics(predictions, references):
     """
-    Mix multiple datasets according to specified ratios.
+    Calculate metrics for hallucination detection.
     
     Args:
-        datasets: Dictionary of datasets to mix
-        mixing_ratios: Dictionary specifying the ratio for each dataset
+        predictions: List of model predictions
+        references: List of ground truth references
         
     Returns:
-        Mixed dataset
+        Dictionary of metrics
     """
-    # First, filter out empty datasets
-    non_empty_datasets = {k: v for k, v in datasets.items() if len(v) > 0}
+    from rouge import Rouge
+    from nltk.translate.bleu_score import sentence_bleu
+    from nltk.tokenize import word_tokenize
+    import nltk
     
-    # If all datasets are empty, return an empty dataset
-    if not non_empty_datasets:
-        print("Warning: All datasets are empty. Creating an empty mixed dataset.")
-        return Dataset.from_dict({"question": [], "answer": []})
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
     
-    # Map dataset names to mixing ratio keys (e.g., "factual" -> "factual_data")
-    ratio_key_mapping = {
-        "factual": "factual_data",
-        "citations": "citation_data",
-        "hallucinations": "hallucination_examples"
+    rouge = Rouge()
+    
+    # Initialize metrics
+    metrics = {
+        "rouge1": 0.0,
+        "rouge2": 0.0,
+        "rougeL": 0.0,
+        "bleu1": 0.0,
+        "bleu4": 0.0,
+        "empty_prediction_rate": 0.0,
+        "hallucination_score": 0.0  # Higher means more hallucination
     }
     
-    # Filter mixing ratios to only include available datasets
-    available_ratios = {}
-    for ds_name in non_empty_datasets:
-        # Get the corresponding ratio key or use the dataset name as a fallback
-        ratio_key = ratio_key_mapping.get(ds_name, ds_name)
-        if ratio_key in mixing_ratios:
-            available_ratios[ds_name] = mixing_ratios[ratio_key]
-        else:
-            # If no matching ratio is found, assign a default ratio
-            available_ratios[ds_name] = 1.0
+    valid_pairs = 0
     
-    # If no valid ratios, assign equal ratios
-    if not available_ratios:
-        available_ratios = {k: 1.0 for k in non_empty_datasets}
-    
-    # Normalize ratios
-    total = sum(available_ratios.values())
-    normalized_ratios = {k: v / total for k, v in available_ratios.items()}
-    
-    # Calculate samples from each dataset
-    min_dataset_size = min([len(ds) for ds in non_empty_datasets.values()])
-    total_samples = min_dataset_size
-    
-    # Calculate samples per dataset
-    dataset_samples = {
-        k: max(1, int(normalized_ratios[k] * total_samples))
-        for k in normalized_ratios
-    }
-    
-    # Adjust for rounding errors
-    remaining = total_samples - sum(dataset_samples.values())
-    if remaining > 0 and dataset_samples:
-        # Add remaining samples to the dataset with the highest ratio
-        max_ratio_key = max(dataset_samples.keys(), key=lambda k: normalized_ratios[k])
-        dataset_samples[max_ratio_key] += remaining
-    
-    # Sample and concatenate datasets
-    mixed_datasets = []
-    for ds_name, num_samples in dataset_samples.items():
-        if num_samples > 0 and ds_name in non_empty_datasets:
-            # Shuffle and select samples
-            shuffled_ds = non_empty_datasets[ds_name].shuffle(seed=DATA_PROCESSING["shuffle_seed"])
-            # Ensure we don't select more samples than available
-            actual_samples = min(num_samples, len(shuffled_ds))
-            if actual_samples > 0:
-                mixed_datasets.append(shuffled_ds.select(range(actual_samples)))
-    
-    # Concatenate all datasets
-    if mixed_datasets:
-        # Get the common features across all datasets
-        common_features = set.intersection(*[set(ds.features.keys()) for ds in mixed_datasets])
+    for pred, ref in zip(predictions, references):
+        # Skip empty predictions or references
+        if not pred or not ref:
+            metrics["empty_prediction_rate"] += 1
+            continue
+            
+        valid_pairs += 1
         
-        # Create a new dictionary with only the common features
-        mixed_data = {}
-        for feature in common_features:
-            mixed_data[feature] = []
-            for ds in mixed_datasets:
-                mixed_data[feature].extend(ds[feature])
+        # Calculate ROUGE scores
+        try:
+            rouge_scores = rouge.get_scores(pred, ref)[0]
+            metrics["rouge1"] += rouge_scores["rouge-1"]["f"]
+            metrics["rouge2"] += rouge_scores["rouge-2"]["f"] 
+            metrics["rougeL"] += rouge_scores["rouge-l"]["f"]
+        except Exception:
+            # Skip Rouge on error
+            pass
         
-        return Dataset.from_dict(mixed_data)
-    else:
-        # Create an empty dataset with a reasonable structure
-        return Dataset.from_dict({"question": [], "answer": []}) 
+        # Calculate BLEU scores
+        try:
+            reference_tokens = word_tokenize(ref.lower())
+            prediction_tokens = word_tokenize(pred.lower())
+            
+            if reference_tokens and prediction_tokens:
+                metrics["bleu1"] += sentence_bleu([reference_tokens], prediction_tokens, 
+                                                weights=(1, 0, 0, 0))
+                metrics["bleu4"] += sentence_bleu([reference_tokens], prediction_tokens, 
+                                                weights=(0.25, 0.25, 0.25, 0.25))
+        except Exception:
+            # Skip BLEU on error
+            pass
+    
+    # Average the metrics
+    if valid_pairs > 0:
+        metrics["rouge1"] /= valid_pairs
+        metrics["rouge2"] /= valid_pairs
+        metrics["rougeL"] /= valid_pairs
+        metrics["bleu1"] /= valid_pairs
+        metrics["bleu4"] /= valid_pairs
+    
+    # Calculate empty prediction rate
+    metrics["empty_prediction_rate"] = metrics["empty_prediction_rate"] / len(predictions) if predictions else 0
+    
+    # Calculate hallucination score (1 - F1 score)
+    # This is a simple approach - the lower the overlap with ground truth, the higher the hallucination
+    metrics["hallucination_score"] = 1.0 - metrics["rougeL"]
+    
+    return metrics 

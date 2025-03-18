@@ -23,7 +23,7 @@
 #SBATCH --partition=researchshort                 # Partition assigned
 #SBATCH --account=sunjunresearch   # Account assigned (use myinfo command to check)
 #SBATCH --qos=research-1-qos         # QOS assigned (use myinfo command to check)
-#SBATCH --job-name=train    # Default job name (will be overridden)
+#SBATCH --job-name=diagnostic    # Default job name (will be overridden)
 #SBATCH --mail-user=myatmin.nay.2022@phdcs.smu.edu.sg  # Email notifications
 
 #################################################
@@ -42,4 +42,4 @@ module load CUDA/12.6.0
 # Activate the environment
 source ~/myenv/bin/activate
 
-python train.py --model_name llama3.1-8b-instruct --dataset_type truthfulqa 
+python diagnostic.py

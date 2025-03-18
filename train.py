@@ -24,16 +24,15 @@ import json
 import random
 
 # Local imports
-from config.model_config import MODELS, LORA_CONFIG, TRAINING_CONFIG, HALLUCINATION_CONFIG
+from config.model_config import MODELS, LORA_CONFIG, TRAINING_CONFIG
 from config.data_config import DATASETS, PROMPT_TEMPLATES, DATA_PROCESSING
-from utils.data_utils import load_and_prepare_datasets, prepare_training_examples, mix_datasets
+from utils.data_utils import load_and_prepare_datasets, prepare_training_examples
 from utils.model_utils import (
     load_base_model_and_tokenizer, 
     prepare_model_for_training,
     create_training_args,
     save_model_and_tokenizer
 )
-from utils.evaluation_utils import evaluate_hallucination
 
 
 # Set up logging
@@ -45,68 +44,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class CustomTrainer(Trainer):
-    """
-    Custom trainer with modified loss function for hallucination mitigation.
-    """
-    
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        Custom loss computation.
-        
-        Args:
-            model: The model to train
-            inputs: The inputs and targets of the model
-            return_outputs: If True, outputs will be returned along with the loss
-            
-        Returns:
-            Loss or tuple (loss, outputs)
-        """
-        # Forward pass
-        outputs = model(**inputs)
-        logits = outputs.logits
-        
-        # Standard language modeling loss (cross entropy)
-        labels = inputs.get("labels")
-        
-        # Standard cross-entropy loss
-        ce_loss = outputs.loss
-        
-        # Calculate additional hallucination penalty (example)
-        # This is a placeholder - modify with your specific loss logic
-        # For example, you could add:
-        # 1. Confidence penalty for uncertain predictions
-        # 2. Knowledge grounding loss 
-        # 3. Citation relevance loss
-        
-        # Example: Add confidence penalty (softmax entropy regularization)
-        # This penalizes overconfident predictions which can lead to hallucinations
-        batch_size, seq_len, vocab_size = logits.shape
-        
-        # Only compute on non-padded tokens
-        mask = (labels != -100).float()
-        
-        # Calculate token-wise entropy
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = torch.exp(log_probs)
-        entropy = -torch.sum(probs * log_probs, dim=-1)
-        
-        # We want to minimize entropy for tokens we're confident about (real knowledge)
-        # but maximize it for tokens we're uncertain about (potential hallucinations)
-        # This is just an example approach
-        
-        # Here we're using a simple regularization term - modify as needed
-        entropy_reg = torch.mean(entropy * mask)
-        entropy_weight = 0.1  # Adjust this weight as needed
-        
-        # Combined loss
-        loss = ce_loss - entropy_weight * entropy_reg  # Negative because we want to maximize entropy
-        
-        # You can add more custom loss components here
-        
-        return (loss, outputs) if return_outputs else loss
-
-
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train a model with LoRA for hallucination mitigation")
@@ -114,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="Llama-3.1-8B-Instruct",
+        default="llama3.1-8b-instruct",
         help="Name of the model to fine-tune (from config)",
     )
     
@@ -128,8 +65,8 @@ def parse_args():
     parser.add_argument(
         "--dataset_type",
         type=str,
-        default="mixed",
-        choices=["factual", "citations", "hallucinations", "mixed"],
+        default="citations",
+        choices=["citations"],
         help="Type of dataset to use for training",
     )
     
@@ -159,13 +96,6 @@ def parse_args():
         help="Maximum number of training steps (overrides num_train_epochs)",
     )
     
-    parser.add_argument(
-        "--entropy_weight",
-        type=float,
-        default=0.1,
-        help="Weight for entropy regularization in loss function",
-    )
-    
     return parser.parse_args()
 
 
@@ -174,10 +104,10 @@ def prepare_dataset_for_training(
     tokenizer: AutoTokenizer
 ) -> Dataset:
     """
-    Prepare dataset for training based on dataset type.
+    Prepare dataset for training.
     
     Args:
-        dataset_type: Type of dataset to use (factual, citations, hallucinations, mixed)
+        dataset_type: Type of dataset to use (should be "citations" for now)
         tokenizer: Tokenizer for the model
         
     Returns:
@@ -186,44 +116,18 @@ def prepare_dataset_for_training(
     # Load datasets
     all_datasets = load_and_prepare_datasets(DATASETS)
     
-    # Get the appropriate datasets based on type
-    if dataset_type == "mixed":
-        # Mix datasets according to the specified ratios
-        train_datasets = {
-            "factual": all_datasets["factual"]["train"],
-            "citations": all_datasets["citations"]["train"],
-            "hallucinations": all_datasets["hallucinations"]["train"]
-        }
-        
-        eval_datasets = {
-            "factual": all_datasets["factual"]["eval"],
-            "citations": all_datasets["citations"]["eval"],
-            "hallucinations": all_datasets["hallucinations"]["eval"]
-        }
-        
-        # Mix training datasets
-        mixed_train = mix_datasets(train_datasets, HALLUCINATION_CONFIG["data_mixing_ratio"])
-        
-        # Mix evaluation datasets
-        mixed_eval = mix_datasets(eval_datasets, HALLUCINATION_CONFIG["data_mixing_ratio"])
-        
-        dataset = {
-            "train": mixed_train,
-            "eval": mixed_eval
-        }
-    else:
-        # Use a single dataset type
-        dataset = {
-            "train": all_datasets[dataset_type]["train"],
-            "eval": all_datasets[dataset_type]["eval"]
-        }
+    # Get the citations dataset
+    dataset = {
+        "train": all_datasets["citations"]["train"],
+        "eval": all_datasets["citations"]["eval"]
+    }
     
     # Get the appropriate template
-    prompt_template = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["factual"])
+    prompt_template = PROMPT_TEMPLATES["citations"]
     
     # Prepare examples for training
-    input_key = DATASETS[dataset_type]["input_key"]
-    output_key = DATASETS[dataset_type]["output_key"]
+    input_key = DATASETS["citations"]["input_key"]
+    output_key = DATASETS["citations"]["output_key"]
     
     train_dataset = prepare_training_examples(
         dataset["train"],
@@ -261,7 +165,6 @@ def main():
     logger.info(f"Model: {args.model_name}")
     logger.info(f"Dataset: {args.dataset_type}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Entropy weight: {args.entropy_weight}")
     
     # Load model and tokenizer
     logger.info("Loading model and tokenizer...")
@@ -281,7 +184,7 @@ def main():
         dataset = prepare_dataset_for_training(args.dataset_type, tokenizer)
         
         # Verify that the datasets are not empty
-        if not dataset["train"] or not dataset["eval"] or len(dataset["train"]["input_ids"]) == 0:
+        if not dataset["train"] or not dataset["eval"] or len(dataset["train"]) == 0:
             logger.error("Training dataset is empty. Check dataset configuration.")
             logger.info("Creating a small synthetic dataset for testing...")
             
@@ -325,7 +228,7 @@ def main():
     )
     
     # Create trainer
-    trainer = CustomTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
@@ -363,9 +266,9 @@ def create_synthetic_dataset(tokenizer, num_samples=100):
         num_samples: Number of synthetic samples to create
         
     Returns:
-        Dictionary with tokenized synthetic data
+        Dataset object with tokenized synthetic data
     """
-    # Generate simple question-answer pairs
+    # Generate simple question-answer pairs with citations
     questions = [
         "What is the capital of France?",
         "Who wrote Romeo and Juliet?",
@@ -375,11 +278,11 @@ def create_synthetic_dataset(tokenizer, num_samples=100):
     ]
     
     answers = [
-        "The capital of France is Paris.",
-        "William Shakespeare wrote Romeo and Juliet.",
-        "The speed of light is approximately 299,792,458 meters per second.",
-        "Mount Everest is the tallest mountain in the world.",
-        "Neil Armstrong was the first person to walk on the moon."
+        "According to the National Geographic Atlas (2020), the capital of France is Paris, which has been the capital since 987 CE when Hugh Capet made the city his seat of government.",
+        "According to the Oxford Companion to English Literature (2000), William Shakespeare wrote Romeo and Juliet around 1595. The play was first published in quarto form in 1597.",
+        "According to measurements by the National Institute of Standards and Technology (2018), the speed of light in a vacuum is exactly 299,792,458 meters per second.",
+        "According to the U.S. Geological Survey (2021), Mount Everest is the tallest mountain in the world at 8,848.86 meters above sea level.",
+        "According to NASA historical records (1969), Neil Armstrong was the first person to walk on the moon on July 21, 1969, during the Apollo 11 mission."
     ]
     
     # Create input prompts with template
@@ -389,7 +292,7 @@ def create_synthetic_dataset(tokenizer, num_samples=100):
     for _ in range(num_samples):
         idx = random.randint(0, len(questions) - 1)
         
-        prompt_template = PROMPT_TEMPLATES["factual"]
+        prompt_template = PROMPT_TEMPLATES["citations"]
         prompt = prompt_template.format(question=questions[idx])
         target = answers[idx]
         
@@ -414,20 +317,21 @@ def create_synthetic_dataset(tokenizer, num_samples=100):
         return_tensors="pt"
     )
     
-    result = {
-        "input_ids": tokenized_inputs.input_ids,
-        "attention_mask": tokenized_inputs.attention_mask,
-        "labels": tokenized_targets.input_ids,
-    }
+    # Create a list of individual examples instead of batched tensors
+    processed_examples = []
+    for i in range(len(prompts)):
+        processed_examples.append({
+            "input_ids": tokenized_inputs.input_ids[i],
+            "attention_mask": tokenized_inputs.attention_mask[i],
+            "labels": torch.where(
+                tokenized_targets.attention_mask[i] == 1,
+                tokenized_targets.input_ids[i],
+                torch.tensor(-100, dtype=torch.long)
+            )
+        })
     
-    # Replace padding token id with -100 in labels for loss calculation
-    result["labels"] = torch.where(
-        tokenized_targets.attention_mask == 1,
-        result["labels"],
-        -100
-    )
-    
-    return result
+    # Convert to Dataset
+    return Dataset.from_list(processed_examples)
 
 
 if __name__ == "__main__":
