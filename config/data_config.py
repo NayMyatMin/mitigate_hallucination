@@ -22,12 +22,6 @@ DATASETS = {
         "split": "validation",  # Use the validation split for TriviaQA
         "config": "rc.nocontext",  # Use the rc.nocontext subset
     },
-    # "nq": {
-    #     "train": "nq",
-    #     "eval": "nq",
-    #     "split": "validation",  # Use the validation split for Natural Questions
-    #     "config": None,
-    # },
     "truthfulqa": {
         "train": None,  # No train split for TruthfulQA
         "eval": "truthfulqa",
@@ -74,16 +68,7 @@ Question:
 
 Answer:
 [/INST]""",
-    # "nq": """[INST] Answer the following question based on the provided context:
 
-# Context:
-# {context}
-
-# Question:
-# {question}
-
-# Answer:
-# [/INST]""",
     "truthfulqa": """[INST] {question}
 
 Please select the true statement from the following choices:

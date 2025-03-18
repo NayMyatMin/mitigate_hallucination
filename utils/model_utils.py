@@ -3,6 +3,7 @@ Utility functions for model loading, configuration and finetuning.
 """
 
 import os
+import logging
 from typing import Dict, Any, Optional, List, Union
 
 import torch
@@ -16,33 +17,52 @@ from transformers import (
 
 from config.model_config import MODELS, LORA_CONFIG, TRAINING_CONFIG
 
+# Set up logging
+logger = logging.getLogger(__name__)
 
 def load_base_model_and_tokenizer(
     model_name: str,
     device_map: str = "auto",
     load_in_8bit: bool = True,
     load_in_4bit: bool = False,
+    torch_dtype: Optional[torch.dtype] = None,
     cache_dir: Optional[str] = None
 ):
     """
     Load a base model and its tokenizer.
     
     Args:
-        model_name: Name of the model in the MODELS config
+        model_name: Name of the model in the MODELS config or a Hugging Face model ID
         device_map: Device mapping strategy
         load_in_8bit: Whether to load the model in 8-bit precision
         load_in_4bit: Whether to load the model in 4-bit precision
+        torch_dtype: Precision to load the model in (float16, float32, bfloat16)
         cache_dir: Directory to cache models
         
     Returns:
         Tuple of (model, tokenizer)
     """
-    if model_name not in MODELS:
-        raise ValueError(f"Model {model_name} not found in config. Available models: {list(MODELS.keys())}")
+    # Check if this is a direct HuggingFace model ID
+    is_hf_model_id = any([
+        model_name.startswith("meta-llama/"),  # Meta Llama models
+        model_name.startswith("mistralai/"),   # Mistral models
+        '/' in model_name                      # General pattern for org/model format
+    ])
     
-    model_config = MODELS[model_name]
-    model_id = model_config["model_id"]
-    tokenizer_id = model_config.get("tokenizer_id", model_id)
+    if is_hf_model_id:
+        logger.info(f"Using direct Hugging Face model ID: {model_name}")
+        model_id = model_name
+        tokenizer_id = model_name
+    elif model_name in MODELS:
+        model_config = MODELS[model_name]
+        model_id = model_config["model_id"]
+        tokenizer_id = model_config.get("tokenizer_id", model_id)
+    else:
+        available_models = list(MODELS.keys())
+        logger.warning(f"Model {model_name} not found in config. Available configured models: {available_models}")
+        logger.info(f"Attempting to load {model_name} directly from Hugging Face...")
+        model_id = model_name
+        tokenizer_id = model_name
     
     # Set up quantization config
     quantization_config = None
@@ -56,24 +76,41 @@ def load_base_model_and_tokenizer(
         )
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_id,
-        cache_dir=cache_dir,
-        padding_side="right",
-        use_fast=True,
-    )
+    logger.info(f"Loading tokenizer: {tokenizer_id}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_id,
+            cache_dir=cache_dir,
+            padding_side="right",
+            use_fast=True,
+        )
+    except Exception as e:
+        logger.error(f"Error loading tokenizer: {e}")
+        logger.info("Trying alternative tokenizer ID...")
+        # Some models might use a different tokenizer than their model ID
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            cache_dir=cache_dir,
+            padding_side="right",
+            use_fast=True,
+        )
     
     # Add special tokens and padding token if needed
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Use provided dtype or default to bfloat16
+    if torch_dtype is None:
+        torch_dtype = torch.bfloat16
+    
     # Load model
+    logger.info(f"Loading model: {model_id} with {torch_dtype} precision")
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         cache_dir=cache_dir,
         device_map=device_map,
         quantization_config=quantization_config,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         trust_remote_code=True,
     )
     
@@ -203,6 +240,8 @@ def load_finetuned_model(
     adapter_path: str,
     device_map: str = "auto",
     load_in_8bit: bool = True,
+    load_in_4bit: bool = False,
+    torch_dtype: Optional[torch.dtype] = None,
     cache_dir: Optional[str] = None
 ):
     """
@@ -213,6 +252,8 @@ def load_finetuned_model(
         adapter_path: Path to the saved adapter
         device_map: Device mapping strategy
         load_in_8bit: Whether to load in 8-bit precision
+        load_in_4bit: Whether to load in 4-bit precision
+        torch_dtype: Precision to load the model in (float16, float32, bfloat16)
         cache_dir: Directory to cache models
         
     Returns:
@@ -223,14 +264,20 @@ def load_finetuned_model(
         model_name=base_model_name,
         device_map=device_map,
         load_in_8bit=load_in_8bit,
+        load_in_4bit=load_in_4bit,
+        torch_dtype=torch_dtype,
         cache_dir=cache_dir
     )
+    
+    # Use provided dtype or default to bfloat16
+    if torch_dtype is None:
+        torch_dtype = torch.bfloat16
     
     # Load adapter
     model = PeftModel.from_pretrained(
         model,
         adapter_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
     )
     
     return model, tokenizer 

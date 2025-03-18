@@ -14,6 +14,7 @@ import logging
 
 from datasets import DownloadConfig
 from config.data_config import DATASETS, PROMPT_TEMPLATES, DATA_PROCESSING
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -345,6 +346,8 @@ def load_and_prepare_datasets(dataset_configs, max_samples=None):
             
             # Try to load the local CSV file first (updated binary choice format)
             try:
+                # Make sure os is explicitly imported here to avoid the scope issue
+                import os
                 csv_path = os.path.join("dataset", "TruthfulQA.csv")
                 print(f"Loading TruthfulQA from local CSV file: {csv_path}")
                 csv_dataset = load_dataset("csv", data_files={"train": csv_path})
