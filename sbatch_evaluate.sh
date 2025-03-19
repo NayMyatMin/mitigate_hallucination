@@ -42,21 +42,65 @@ module load CUDA/12.6.0
 # Activate the environment
 source ~/myenv/bin/activate
 
-# LLAMA 3.1
-python evaluate.py --model_name llama3.1-8b-instruct \
-    --dataset_types coqa squad_v2 halueval_qa truthfulqa \
-    --max_eval_samples 1 \
+# If no value is provided, set these to defaults
+MODEL_NAME=${MODEL_NAME:-"llama3.1-8b-instruct"}
+DATASET_TYPES=${DATASET_TYPES:-"coqa squad_v2 triviaqa truthfulqa halueval_qa"}
+MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-1}
+USE_GPT4O_MINI=${USE_GPT4O_MINI:-"true"}
+
+# Extract API key from .bashrc - more robust method for both HF and OpenAI keys
+BASHRC_PATH=~/.bashrc
+if [ -f "$BASHRC_PATH" ]; then
+    # Try to get Hugging Face token with various patterns to handle different formats
+    HF_TOKEN_LINE=$(grep 'HUGGING_FACE_HUB_TOKEN' "$BASHRC_PATH" | tail -n 1)
+    if [[ "$HF_TOKEN_LINE" == *"=\""* ]]; then
+        HF_TOKEN=$(echo "$HF_TOKEN_LINE" | sed -E 's/.*="([^"]+)".*/\1/')
+    elif [[ "$HF_TOKEN_LINE" == *"='"* ]]; then
+        HF_TOKEN=$(echo "$HF_TOKEN_LINE" | sed -E "s/.*='([^']+)'.*/\1/")
+    else
+        HF_TOKEN=$(echo "$HF_TOKEN_LINE" | sed -E 's/.*=([^ ]+).*/\1/')
+    fi
+    
+    # Try to get OpenAI API key with various patterns
+    OPENAI_API_KEY_LINE=$(grep 'OPENAI_API_KEY' "$BASHRC_PATH" | tail -n 1)
+    if [[ "$OPENAI_API_KEY_LINE" == *"=\""* ]]; then
+        OPENAI_API_KEY=$(echo "$OPENAI_API_KEY_LINE" | sed -E 's/.*="([^"]+)".*/\1/')
+    elif [[ "$OPENAI_API_KEY_LINE" == *"='"* ]]; then
+        OPENAI_API_KEY=$(echo "$OPENAI_API_KEY_LINE" | sed -E "s/.*='([^']+)'.*/\1/")
+    else
+        OPENAI_API_KEY=$(echo "$OPENAI_API_KEY_LINE" | sed -E 's/.*=([^ ]+).*/\1/')
+    fi
+fi
+
+# Export both tokens as environment variables
+export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+export OPENAI_API_KEY="$OPENAI_API_KEY"
+
+# Optional: set up GPT4o mini flag based on environment variable
+GPT4O_FLAG=""
+if [ "$USE_GPT4O_MINI" = "true" ]; then
+    GPT4O_FLAG="--use_gpt4o_mini"
+    echo "Will use GPT-4o-mini for evaluation"
+fi
+
+# Print evaluation parameters
+echo "-------------------------------------"
+echo "Starting evaluation with parameters:"
+echo "Model: $MODEL_NAME"
+echo "Datasets: $DATASET_TYPES"
+echo "Samples per dataset: $MAX_EVAL_SAMPLES"
+echo "Using GPT-4o-mini: $USE_GPT4O_MINI"
+echo "-------------------------------------"
+
+# Run evaluation script with the defined parameters
+python evaluate.py \
+    --model_name "$MODEL_NAME" \
+    --adapter_path "$ADAPTER_PATH" \
+    --dataset_types $DATASET_TYPES \
+    --max_eval_samples $MAX_EVAL_SAMPLES \
+    --clean_predictions \
     --save_predictions \
-    --clean_predictions
+    --hallucination_analysis \
+    $GPT4O_FLAG
 
-# MISTRAL 7B
-# python evaluate.py --model_name mistral-7b-instruct-v0.3 \
-#     --dataset_types coqa squad_v2 halueval_qa truthfulqa \
-#     --max_eval_samples 1 \
-#     --save_predictions 
-
-# LLAMA 2
-# python evaluate.py --model_name llama2-7b-chat \
-#     --dataset_types coqa squad_v2 halueval_qa truthfulqa \
-#     --max_eval_samples 1 \
-#     --save_predictions 
+echo "Evaluation completed!"

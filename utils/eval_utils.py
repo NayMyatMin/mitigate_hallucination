@@ -99,7 +99,7 @@ def get_argparser():
         "--max_new_tokens",
         type=int,
         default=256,
-        help="Maximum number of tokens to generate for each prediction",
+        help="Maximum number of tokens to generate",
     )
     
     parser.add_argument(
@@ -109,30 +109,46 @@ def get_argparser():
         help="Batch size for evaluation",
     )
     
-    # Other arguments
+    # Saving arguments
+    parser.add_argument(
+        "--save_predictions",
+        action="store_true",
+        help="Whether to save model predictions",
+    )
+    
+    # Evaluation options
+    parser.add_argument(
+        "--hallucination_analysis",
+        action="store_true",
+        help="Whether to perform detailed hallucination pattern analysis",
+    )
+    
+    # GPT-4o-mini evaluation arguments
+    parser.add_argument(
+        "--use_gpt4o_mini",
+        action="store_true",
+        help="Whether to use GPT-4o-mini as a judge for evaluating hallucination",
+    )
+    
+    parser.add_argument(
+        "--openai_api_key",
+        type=str,
+        default=None,
+        help="OpenAI API key for GPT-4o-mini evaluation (optional, will use env var if not provided)",
+    )
+    
+    # Other
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed",
+        help="Random seed for reproducibility",
     )
     
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
-    )
-    
-    parser.add_argument(
-        "--save_predictions",
-        action="store_true",
-        help="Whether to save all predictions and reference answers",
-    )
-    
-    parser.add_argument(
-        "--hallucination_analysis",
-        action="store_true",
-        help="Perform detailed hallucination analysis",
     )
     
     return parser
@@ -460,15 +476,37 @@ def analyze_hallucination_patterns(predictions: List[str], references: List[str]
         "is_empty": "sum"
     })
     
-    # Analyze correlation between context length and hallucination
-    context_corr = df["context_length"].corr(df["hallucination_score"])
+    # Convert DataFrame to dictionary but handle the MultiIndex columns
+    # This will create a nested dictionary with string keys instead of tuple keys
+    severity_dict = {}
+    for severity in severity_analysis.index:
+        severity_dict[severity] = {}
+        for (col1, col2) in severity_analysis.columns:
+            # Convert tuple key to string key
+            if col2 == "":
+                # If the second level is empty, just use the first level
+                key = col1
+            else:
+                # Otherwise, combine them with underscore
+                key = f"{col1}_{col2}"
+            severity_dict[severity][key] = severity_analysis.loc[severity, (col1, col2)]
+    
+    # Analyze correlation between context length and hallucination, but only if we have enough data
+    # We need at least 2 different values to calculate meaningful correlation
+    if len(df) >= 2 and df["context_length"].nunique() > 1 and df["hallucination_score"].nunique() > 1:
+        context_corr = df["context_length"].corr(df["hallucination_score"])
+    else:
+        context_corr = float('nan')
     
     # Analyze correlation between reference length and hallucination
-    reference_corr = df["reference_length"].corr(df["hallucination_score"])
+    if len(df) >= 2 and df["reference_length"].nunique() > 1 and df["hallucination_score"].nunique() > 1:
+        reference_corr = df["reference_length"].corr(df["hallucination_score"])
+    else:
+        reference_corr = float('nan')
     
     # Prepare analysis results
     analysis_results = {
-        "severity_distribution": severity_analysis.to_dict(),
+        "severity_distribution": severity_dict,
         "empty_predictions": int(df["is_empty"].sum()),
         "context_length_correlation": context_corr,
         "reference_length_correlation": reference_corr,
@@ -574,24 +612,42 @@ def calculate_aggregate_metrics(summary: Dict[str, Dict[str, float]]) -> Dict[st
         "hallucination_score": 0.0,
     }
     
-    # Count datasets with standard metrics
-    std_metric_count = 0
+    # GPT-4o-mini metrics to aggregate if available
+    gpt4o_metrics = {
+        "gpt4o_mini_avg_score": 0.0,
+        "gpt4o_mini_hallucination_rate": 0.0
+    }
+    
+    # Keep track of datasets with each metric
+    metric_counts = {metric: 0 for metric in aggregate_metrics}
+    gpt4o_metric_counts = {metric: 0 for metric in gpt4o_metrics}
     
     for dataset_type, metrics in summary.items():
         # Skip TruthfulQA binary choice when aggregating standard metrics
         if dataset_type == "truthfulqa" and "truthfulqa_binary_accuracy" in metrics:
             continue
             
+        # Aggregate standard metrics
         for metric in aggregate_metrics:
-            if metric in metrics:
+            if metric in metrics and not pd.isna(metrics[metric]):
                 aggregate_metrics[metric] += metrics[metric]
+                metric_counts[metric] += 1
         
-        std_metric_count += 1
+        # Aggregate GPT-4o-mini metrics if present
+        for metric in gpt4o_metrics:
+            if metric in metrics and not pd.isna(metrics[metric]):
+                gpt4o_metrics[metric] += metrics[metric]
+                gpt4o_metric_counts[metric] += 1
     
-    # Average across datasets with standard metrics
-    if std_metric_count > 0:
-        for metric in aggregate_metrics:
-            aggregate_metrics[metric] /= std_metric_count
+    # Average across datasets for each metric
+    for metric in aggregate_metrics:
+        if metric_counts[metric] > 0:
+            aggregate_metrics[metric] /= metric_counts[metric]
+    
+    # Average GPT-4o-mini metrics if they were present
+    for metric in gpt4o_metrics:
+        if gpt4o_metric_counts[metric] > 0:
+            aggregate_metrics[metric] = gpt4o_metrics[metric] / gpt4o_metric_counts[metric]
     
     # Add TruthfulQA binary accuracy if available
     if "truthfulqa" in summary and "truthfulqa_binary_accuracy" in summary["truthfulqa"]:
@@ -698,16 +754,29 @@ def prepare_dataset_for_evaluation(dataset_type: str, max_samples: Optional[int]
             eval_data["prompts"].append(prompt)
         # Standard case for other datasets
         else:
-            prompt_dict = {"question": question}
-            if context:
-                prompt_dict["context"] = context
-            
             try:
-                prompt = prompt_template.format(**prompt_dict)
+                # Handle TriviaQA specially since it often has empty contexts
+                if dataset_type == "triviaqa":
+                    # TriviaQA with rc.nocontext config has empty contexts
+                    prompt = prompt_template.format(question=question, context=context or "No context provided")
+                else:
+                    # Standard prompt formatting
+                    prompt_dict = {"question": question}
+                    if "context" in prompt_template:
+                        prompt_dict["context"] = context or "No context provided"
+                    prompt = prompt_template.format(**prompt_dict)
+                
+                eval_data["prompts"].append(prompt)
+            except KeyError as e:
+                logger.error(f"Error formatting prompt: {e}")
+                # Provide a basic fallback prompt
+                prompt = f"[INST] {question} [/INST]"
                 eval_data["prompts"].append(prompt)
             except Exception as e:
-                logger.error(f"Error formatting prompt: {e}")
-                eval_data["prompts"].append("")
+                logger.error(f"Unexpected error formatting prompt: {e}")
+                # Provide a very basic fallback prompt
+                prompt = f"[INST] {question} [/INST]"
+                eval_data["prompts"].append(prompt)
     
     # Verify that data was loaded properly
     if not eval_data["prompts"]:
@@ -721,3 +790,205 @@ def prepare_dataset_for_evaluation(dataset_type: str, max_samples: Optional[int]
         logger.info(f"Sample prompt:\n{eval_data['prompts'][0][:500]}...")
     
     return eval_data 
+
+def evaluate_with_gpt4o_mini(
+    questions: List[str],
+    contexts: List[str],
+    references: List[str],
+    predictions: List[str],
+    openai_api_key: str,
+    dataset_type: str
+):
+    """
+    Evaluate hallucination using GPT-4o-mini as a judge.
+    
+    Args:
+        questions: List of questions
+        contexts: List of contexts
+        references: List of reference answers
+        predictions: List of model predictions
+        openai_api_key: OpenAI API key
+        dataset_type: Type of dataset
+        
+    Returns:
+        evaluation_results: List of evaluation results with hallucination scores
+    """
+    import requests
+    import json
+    from tqdm import tqdm
+    import os
+    
+    # Try to get API key from environment if not provided explicitly
+    if not openai_api_key:
+        openai_api_key = os.environ.get("OPENAI_API_KEY")
+        
+    if not openai_api_key:
+        logger.error("OpenAI API key not provided and not found in environment, skipping GPT-4o-mini evaluation")
+        return None
+    
+    logger.info("Evaluating hallucination using GPT-4o-mini...")
+    
+    # Set up OpenAI API
+    api_url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {openai_api_key}"
+    }
+    
+    evaluation_results = []
+    
+    for i in tqdm(range(len(questions))):
+        # Prepare evaluation prompt
+        if dataset_type == "truthfulqa":
+            # Binary choice evaluation for TruthfulQA
+            eval_prompt = f"""
+            Please evaluate the following question-answer pair for hallucination:
+            
+            Question: {questions[i]}
+            
+            True answer: {references[i]}
+            
+            Model's answer: {predictions[i]}
+            
+            Score the model's answer on a scale of 1-5 where:
+            1: Completely hallucinated/incorrect answer
+            2: Mostly incorrect with some accurate elements
+            3: Partially correct but contains significant hallucinations
+            4: Mostly correct with minor hallucinations
+            5: Completely correct with no hallucinations
+            
+            Provide ONLY a JSON object with the following format:
+            {{
+                "score": [score between 1-5],
+                "explanation": [brief explanation of your scoring decision]
+            }}
+            """
+        else:
+            # Standard evaluation for other datasets
+            eval_prompt = f"""
+            Please evaluate the following question-answer pair for hallucination:
+            
+            Question: {questions[i]}
+            
+            Context: {contexts[i]}
+            
+            Reference answer: {references[i]}
+            
+            Model's answer: {predictions[i]}
+            
+            Score the model's answer on a scale of 1-5 where:
+            1: Completely hallucinated/incorrect answer
+            2: Mostly incorrect with some accurate elements
+            3: Partially correct but contains significant hallucinations
+            4: Mostly correct with minor hallucinations
+            5: Completely correct with no hallucinations
+            
+            Provide ONLY a JSON object with the following format:
+            {{
+                "score": [score between 1-5],
+                "explanation": [brief explanation of your scoring decision]
+            }}
+            """
+        
+        # Make API request
+        try:
+            data = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": "You are an AI assistant that evaluates answers for hallucination."},
+                    {"role": "user", "content": eval_prompt}
+                ],
+                "temperature": 0.0
+            }
+            
+            response = requests.post(api_url, headers=headers, json=data)
+            response.raise_for_status()
+            result = response.json()
+            
+            # Extract and parse the evaluation
+            eval_text = result["choices"][0]["message"]["content"]
+            
+            # Parse the JSON response
+            try:
+                eval_result = json.loads(eval_text)
+                eval_result["question"] = questions[i]
+                eval_result["reference"] = references[i]
+                eval_result["prediction"] = predictions[i]
+                evaluation_results.append(eval_result)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse GPT-4o-mini response as JSON for sample {i}")
+                evaluation_results.append({
+                    "question": questions[i],
+                    "reference": references[i],
+                    "prediction": predictions[i],
+                    "score": 0,
+                    "explanation": "Error parsing evaluation",
+                    "raw_response": eval_text
+                })
+                
+        except Exception as e:
+            logger.error(f"Error in GPT-4o-mini evaluation for sample {i}: {e}")
+            evaluation_results.append({
+                "question": questions[i],
+                "reference": references[i],
+                "prediction": predictions[i],
+                "score": 0,
+                "explanation": f"Error: {str(e)}"
+            })
+    
+    return evaluation_results
+
+def calculate_gpt4o_mini_metrics(evaluation_results):
+    """
+    Calculate metrics from GPT-4o-mini evaluation results.
+    
+    Args:
+        evaluation_results: List of evaluation results from GPT-4o-mini
+        
+    Returns:
+        metrics: Dictionary with aggregated metrics
+    """
+    if not evaluation_results:
+        return {
+            "gpt4o_mini_avg_score": 0.0,
+            "gpt4o_mini_hallucination_rate": 1.0,
+            "gpt4o_mini_scores_distribution": {},
+        }
+    
+    # Extract scores
+    scores = [result.get("score", 0) for result in evaluation_results]
+    
+    # Filter out error scores (0)
+    valid_scores = [score for score in scores if score > 0]
+    
+    # Calculate metrics
+    if valid_scores:
+        avg_score = sum(valid_scores) / len(valid_scores)
+        
+        # Calculate hallucination rate (scores <= 3 are considered hallucinated)
+        hallucinated = sum(1 for score in valid_scores if score <= 3)
+        hallucination_rate = hallucinated / len(valid_scores)
+        
+        # Get score distribution
+        distribution = {}
+        for score in range(1, 6):
+            count = sum(1 for s in valid_scores if s == score)
+            distribution[str(score)] = count
+        
+        metrics = {
+            "gpt4o_mini_avg_score": avg_score,
+            "gpt4o_mini_hallucination_rate": hallucination_rate,
+            "gpt4o_mini_scores_distribution": distribution,
+            "gpt4o_mini_valid_samples": len(valid_scores),
+            "gpt4o_mini_total_samples": len(evaluation_results),
+        }
+    else:
+        metrics = {
+            "gpt4o_mini_avg_score": 0.0,
+            "gpt4o_mini_hallucination_rate": 1.0,
+            "gpt4o_mini_scores_distribution": {},
+            "gpt4o_mini_valid_samples": 0,
+            "gpt4o_mini_total_samples": len(evaluation_results),
+        }
+    
+    return metrics 

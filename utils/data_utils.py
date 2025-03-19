@@ -603,6 +603,7 @@ def calculate_hallucination_metrics(predictions, references):
     from nltk.translate.bleu_score import sentence_bleu
     from nltk.tokenize import word_tokenize
     import nltk
+    import re
     
     try:
         nltk.data.find('tokenizers/punkt')
@@ -624,13 +625,53 @@ def calculate_hallucination_metrics(predictions, references):
     
     valid_pairs = 0
     
-    for pred, ref in zip(predictions, references):
+    # Helper function to normalize text
+    def normalize_text(text):
+        if not text:
+            return ""
+        
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Remove punctuation except apostrophes
+        text = re.sub(r'[^\w\s\']', ' ', text)
+        
+        # Replace multiple spaces with a single space
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Trim whitespace
+        text = text.strip()
+        
+        return text
+    
+    for pred_raw, ref_raw in zip(predictions, references):
         # Skip empty predictions or references
+        if not pred_raw or not ref_raw:
+            metrics["empty_prediction_rate"] += 1
+            continue
+        
+        # Normalize prediction and reference
+        pred = normalize_text(pred_raw)
+        ref = normalize_text(ref_raw)
+        
+        # Skip if either is empty after normalization
         if not pred or not ref:
             metrics["empty_prediction_rate"] += 1
             continue
             
         valid_pairs += 1
+        
+        # Special handling for very short answers (like those in CoQA)
+        if len(ref.split()) <= 2:
+            # For very short answers, check if the prediction contains the reference
+            # This helps with cases where the answer is just a single word like "white"
+            if ref in pred:
+                metrics["rouge1"] += 1.0
+                metrics["rouge2"] += 1.0 if len(ref.split()) > 1 else 0.0
+                metrics["rougeL"] += 1.0
+                metrics["bleu1"] += 1.0
+                metrics["bleu4"] += 1.0 if len(ref.split()) > 3 else 0.0
+                continue
         
         # Calculate ROUGE scores
         try:
@@ -638,14 +679,22 @@ def calculate_hallucination_metrics(predictions, references):
             metrics["rouge1"] += rouge_scores["rouge-1"]["f"]
             metrics["rouge2"] += rouge_scores["rouge-2"]["f"] 
             metrics["rougeL"] += rouge_scores["rouge-l"]["f"]
-        except Exception:
-            # Skip Rouge on error
-            pass
+        except Exception as e:
+            # Try with a simpler approach if rouge fails
+            pred_words = set(pred.split())
+            ref_words = set(ref.split())
+            if pred_words and ref_words:
+                # Simple word overlap as fallback
+                overlap = len(pred_words.intersection(ref_words))
+                total = len(pred_words.union(ref_words))
+                f1_score = overlap / total if total > 0 else 0
+                metrics["rouge1"] += f1_score
+                metrics["rougeL"] += f1_score
         
         # Calculate BLEU scores
         try:
-            reference_tokens = word_tokenize(ref.lower())
-            prediction_tokens = word_tokenize(pred.lower())
+            reference_tokens = word_tokenize(ref)
+            prediction_tokens = word_tokenize(pred)
             
             if reference_tokens and prediction_tokens:
                 metrics["bleu1"] += sentence_bleu([reference_tokens], prediction_tokens, 
@@ -668,7 +717,6 @@ def calculate_hallucination_metrics(predictions, references):
     metrics["empty_prediction_rate"] = metrics["empty_prediction_rate"] / len(predictions) if predictions else 0
     
     # Calculate hallucination score (1 - F1 score)
-    # This is a simple approach - the lower the overlap with ground truth, the higher the hallucination
     metrics["hallucination_score"] = 1.0 - metrics["rougeL"]
     
     return metrics 
